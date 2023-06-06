@@ -6,16 +6,14 @@ from twisted.internet import reactor
 from twisted.internet.protocol import Factory
 from twisted.protocols.basic import LineReceiver
 
-PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__) + "../../../")
+PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__) + "../../../../../")
 sys.path.append(PROJECT_ROOT)
 os.environ['DJANGO_SETTINGS_MODULE'] = 'antenna.settings'
 django.setup()
-from modules.config.setting import PLATFORM_DOMAIN
+
 from modules.message.constants import MESSAGE_TYPES
-from modules.message.models import Message
-from modules.task.models import TaskConfigItem
-from modules.template.depend.base import BaseTemplate
-from utils.helper import send_message
+from modules.template.depend.base import *
+from modules.config import setting
 
 WELCOME_MSG = b'220 (vsFTPd 2.0.5) '
 GOODBYE_MSG = b'221 Goodbye.'
@@ -42,17 +40,11 @@ class Ftp(LineReceiver):
 
     def connectionLost(self, line):
         self.sendLine(GOODBYE_MSG)
-        task_config_item = TaskConfigItem.objects.filter(task_config__key=self.key,
-                                                         task__status=1).first()
-        if task_config_item and (
-            task_config_item.template.name == "FTP" or task_config_item.template.name == "XXE"):
-            Message.objects.create(domain=PLATFORM_DOMAIN, message_type=MESSAGE_TYPES.FTP,
-                                   remote_addr=self.remote_addr,
-                                   task_id=task_config_item.task_id, template_id=task_config_item.template_id,
-                                   content=self.content)
-            send_message(url=PLATFORM_DOMAIN, remote_addr=self.remote_addr, uri='', header='',
-                         message_type=MESSAGE_TYPES.HTTP, content=self.content,
-                         task_id=task_config_item.task_id)
+        flag, task_config_item = hit(self.key, template_name=["FTP", "XXE"], iexact=False)
+        if flag:
+            message_callback(domain=setting.PLATFORM_DOMAIN, remote_addr=self.remote_addr,
+                             task_config_item=task_config_item, uri='', header='', message_type=MESSAGE_TYPES.FTP,
+                             content=self.content)
 
     def lineReceived(self, line):
         if self.state == 'get_name':

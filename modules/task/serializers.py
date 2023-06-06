@@ -22,6 +22,7 @@ class CreateTaskConfigItemSerializer(serializers.Serializer):
     template = serializers.IntegerField(required=True, help_text="组件id")
     template_config_item_list = serializers.JSONField(required=True, help_text="组件配置列表")
     task = serializers.IntegerField(required=True, help_text="任务id")
+    url_template = serializers.IntegerField(required=True, help_text="url模板id")
 
 
 class TaskConfigSerializer(serializers.ModelSerializer):
@@ -73,5 +74,5 @@ class DeleteTmpTaskSerializer(serializers.Serializer):
     task_id = serializers.IntegerField(required=True, help_text="删除缓存任务")
 
     def validate_task_id(self, task_id):
-        if not Task.objects.filter(task_id=task_id, user_id=self.context["user"].id).exists():
+        if not Task.objects.filter(id=task_id, user_id=self.context["user"].id).exists():
             raise ValidationError('未知的任务id')

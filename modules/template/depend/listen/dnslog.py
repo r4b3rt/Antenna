@@ -1,143 +1,145 @@
-import copy
+from ipaddress import IPv4Address
+import socket
+
+from twisted.internet import reactor, defer
+from twisted.names import client, dns, error, server
+
+# 导入twisted的相关模块
 import os
 import re
 import sys
-import tempfile
-
+import fnmatch
 import django
-from dnslib import QTYPE, RCODE, RR, TXT
-from dnslib.server import BaseResolver, DNSServer
+from itertools import cycle
 
-from modules.message.constants import MESSAGE_TYPES
-from utils.helper import send_message
+from twisted.internet import reactor
+from twisted.names import dns, server
+from twisted.names.dns import DNSDatagramProtocol
 
-PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__) + "../../../")
+PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__) + "../../../../../")
 sys.path.append(PROJECT_ROOT)
 os.environ['DJANGO_SETTINGS_MODULE'] = 'antenna.settings'
 django.setup()
 
-from modules.config.setting import DNS_DOMAIN, DNS_PORT, NS1_DOMAIN, NS2_DOMAIN, SERVER_IP
-from modules.message.models import Message
-from modules.task.models import TaskConfig, TaskConfigItem
-from modules.template.depend.base import BaseTemplate
+from modules.message.constants import MESSAGE_TYPES
+from modules.config.models import DnsConfig
+from modules.template.depend.base import *
 
 
-class MysqlLogger():
-    def log_data(self, dnsobj):
-        pass
-
-    def log_error(self, handler, e):
-        pass
-
-    def log_pass(self, *args):
-        pass
-
-    def log_prefix(self, handler):
-        pass
-
-    def log_recv(self, handler, data):
-        pass
-
-    def log_reply(self, handler, reply):
-        pass
-
-    def log_request(self, handler, request):
-        domain = request.q.qname.__str__()
-        print('domain=======>', domain)
-        if domain.endswith(DNS_DOMAIN + '.'):
-            udomain = re.search(r'\.?([^\.]+)\.%s\.' % DNS_DOMAIN, domain)
-            print('udomain=======>', udomain)
-            if udomain:
-                print("udomain.group(1))======>", udomain.group(1))
-                domain_key = udomain.group(1)
-                task_config_item = TaskConfigItem.objects.filter(task_config__key__iexact=domain_key,
-                                                                 task__status=1).first()
-                if task_config_item and task_config_item.template.name == "DNS":
-                    domain = domain.strip(".")
-                    Message.objects.create(domain=domain, message_type=MESSAGE_TYPES.DNS,
-                                           remote_addr=handler.client_address[0],
-                                           task_id=task_config_item.task_id, template_id=task_config_item.template_id)
-                    send_message(url=domain, remote_addr=handler.client_address[0], uri='', header='',
-                                 message_type=MESSAGE_TYPES.DNS, content='', task_id=task_config_item.task_id)
-
-    def log_send(self, handler, data):
-        pass
-
-    def log_truncated(self, handler, reply):
-        pass
+def get_dns_record():
+    close_old_connections()
+    return DnsConfig.objects.all()
 
 
-class ZoneResolver(BaseResolver):
+class DNSServerFactory(server.DNSServerFactory):
+    def handleQuery(self, message, protocol, address):
+        # 感谢 suppress\excessive 同学发现python3.6版本运行bug，已fix
+        sock_type = protocol.transport.socket.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+        if sock_type == socket.SOCK_DGRAM:
+            self.peer_address = address[0]
+        elif sock_type == socket.SOCK_DGRAM:
+            self.peer_address = IPv4Address('UDP', *address)[0]
+        else:
+            raise ("Unexpected socket type %r" % protocol.transport.socket.type)
+        # Make peer_address available to resolvers that support that attribute
+        for resolver in self.resolver.resolvers:
+            if hasattr(resolver, 'peer_address'):
+                resolver.peer_address = self.peer_address
+        return server.DNSServerFactory.handleQuery(self, message, protocol, address)
+
+
+class DynamicResolver(object):
     """
-        Simple fixed zone file resolver.
+    A resolver which calculates the answers to certain queries based on the
+    query type and name.
     """
 
-    def __init__(self, zone, glob=False):
-        """
-            Initialise resolver from zone file.
-            Stores RRs as a list of (label,type,rr) tuples
-            If 'glob' is True use glob match against zone file
-        """
-        self.zone = [(rr.rname, QTYPE[rr.rtype], rr)
-                     for rr in RR.fromZone(zone)]
-        self.glob = glob
-        self.eq = 'matchGlob' if glob else '__eq__'
+    def __init__(self):
+        super().__init__()
+        # 初始化变量
+        self._peer_address = None
+        self.dns_config = {}
+        close_old_connections()
+        self.dns_recoed = get_dns_record()
+        self.dns_config_domain = [_dns.domain for _dns in self.dns_recoed]
+        for _dns in self.dns_recoed:
+            self.dns_config[_dns.domain] = cycle(_dns.value)
 
-    def resolve(self, request, handler):
+    @property
+    def peer_address(self):
+        return self._peer_address
+
+    @peer_address.setter
+    def peer_address(self, value):
+        self._peer_address = value
+
+    def _dynamicResponseRequired(self, query):
         """
-            Respond to DNS request - parameters are request packet & handler.
-            Method is expected to return DNS response
+        Check the query to determine if a dynamic response is required.
+        A:1
+        AAAA:28
+        CNAME:5
+        MX:15
         """
-        reply = request.reply()
-        qname = request.q.qname
-        qtype = QTYPE[request.q.qtype]
-        if qtype == 'TXT':
-            txtpath = os.path.join(tempfile.gettempdir(), str(qname).lower())
-            if os.path.isfile(txtpath):
-                reply.add_answer(
-                    RR(qname, QTYPE.TXT, rdata=TXT(open(txtpath).read().strip())))
-        for name, rtype, rr in self.zone:
-            # Check if label & type match
-            if getattr(qname, self.eq)(name) and (qtype == rtype or qtype == 'ANY'
-                                                  or rtype == 'CNAME'):
-                # If we have a glob match fix reply label
-                if self.glob:
-                    a = copy.copy(rr)
-                    a.rname = qname
-                    reply.add_answer(a)
+        return True
+
+    def _doDynamicResponse(self, query):
+        """
+        Calculate the response to a query.
+        """
+        answers = []
+        # 获取查询的域名和类型
+        name = query.name.name
+        addr = self.peer_address
+        _type = query.type
+        self.dns_config_domain.sort(key=lambda x: x.startswith("*"))  # 进行排序
+        print("请求解析域名：", name.decode("utf-8"), flush=True)
+        for domain in self.dns_config_domain:
+            print("匹配域名", domain, "匹配结果:", fnmatch.fnmatch(name.decode("utf-8").lower(), domain.lower()))
+            if fnmatch.fnmatch(name.decode("utf-8").lower(), domain.lower()):
+                close_old_connections()
+                if len(list(self.dns_recoed.get(domain=domain.lower()).value)) == 1:
+                    ttl = 60
                 else:
-                    reply.add_answer(rr)
-                # Check for A/AAAA records associated with reply and
-                # add in additional section
-                if rtype in ['CNAME', 'NS', 'MX', 'PTR']:
-                    for a_name, a_rtype, a_rr in self.zone:
-                        if a_name == rr.rdata.label and a_rtype in [
-                            'A', 'AAAA'
-                        ]:
-                            reply.add_ar(a_rr)
-        if not reply.rr:
-            reply.header.rcode = RCODE.NXDOMAIN
-        print('reply======>', reply)
-        return reply
+                    ttl = 0
+                print("ttl:", ttl, flush=True)
+                answers.append(dns.RRHeader(
+                    name=name,
+                    payload=dns.Record_A(address=bytes(next(self.dns_config[domain.lower()]), encoding="utf-8")),
+                    ttl=ttl))
+                # 存储数据
+                udomain = re.findall(r'\.?([^\.]+)\.%s' % setting.DNS_DOMAIN.strip("*."), name.decode("utf-8").lower())
+                if udomain:
+                    flag, task_config_item = hit(udomain[0], template_name=["DNS"], iexact=True)  # 不区分大小写
+                    if flag:
+                        message_callback(domain=name.decode("utf-8"), remote_addr=addr,
+                                         task_config_item=task_config_item, uri='',
+                                         header='', message_type=MESSAGE_TYPES.DNS, content='')  # 命中回调
+                break
+        authority = []
+        additional = []
+        return answers, authority, additional
+
+    def query(self, query, timeout=None):
+        """
+        Check if the query should be answered dynamically, otherwise dispatch to
+        the fallback resolver.
+        """
+        if self._dynamicResponseRequired(query):
+            return defer.succeed(self._doDynamicResponse(query))
+        else:
+            return defer.fail(error.DomainError())
 
 
 def main():
-    zone = '''
-*.{dnsdomain}.       IN      NS      {ns1domain}.
-*.{dnsdomain}.       IN      NS      {ns2domain}.
-*.{dnsdomain}.       IN      A       {serverip}
-{dnsdomain}.         IN      A       {serverip}
-'''.format(
-        dnsdomain=DNS_DOMAIN,
-        ns1domain=NS1_DOMAIN,
-        ns2domain=NS2_DOMAIN,
-        serverip=SERVER_IP)
-    resolver = ZoneResolver(zone, True)
-    print("当前DNS解析表:\r\n" + zone)
-    logger = MysqlLogger()
-    print("Starting Zone Resolver (%s:%d) [%s]" % ("*", DNS_PORT, "UDP"))
-    udp_server = DNSServer(resolver, port=53, address="0.0.0.0", logger=logger)
-    udp_server.start()
+    """
+    Run the server.
+    """
+    factory = DNSServerFactory(clients=[DynamicResolver()])
+    protocol = DNSDatagramProtocol(controller=factory)
+    reactor.listenUDP(53, protocol, interface="0.0.0.0")
+
+    reactor.run()
 
 
 class DnsTemplate(BaseTemplate):

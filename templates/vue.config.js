@@ -20,13 +20,14 @@ const vueConfig = {
             })
         )
     },
+    //http://42.187.161.143/aaa#/user/login
     lintOnSave: false, //关闭eslintre语法检查
     devServer: {
         open: true,
         disableHostCheck: true,
         proxy: {
             '^/api': {
-                target: 'http://58antenna.cn', //后端地址
+                target: 'http://42.187.161.143', //后端地址
                 ws: true, //是否代理websockets
                 changeOrigin: true,
             },
